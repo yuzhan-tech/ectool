@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serialport::SerialPort;
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 use super::consts::*;
 use super::protocol::*;
@@ -10,6 +11,27 @@ use crate::util::checksum::{crc8_maxim, self_def_check1};
 fn command_label(command: u8) -> String {
     format!("command 0x{command:02X}")
 }
+
+#[derive(Debug)]
+struct DeviceResponseState {
+    command: u8,
+    state: u8,
+    payload: Vec<u8>,
+}
+
+impl fmt::Display for DeviceResponseState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} response state is NAK/error {} (payload {})",
+            command_label(self.command),
+            self.state,
+            hex::encode(&self.payload)
+        )
+    }
+}
+
+impl std::error::Error for DeviceResponseState {}
 
 fn encode_checked_length(length: u32) -> u32 {
     if length == 0 {
@@ -163,11 +185,12 @@ fn read_validated_response(
         );
     }
     if response.state != 0 {
-        bail!(
-            "{label} response state is NAK/error {} (payload {})",
-            response.state,
-            hex::encode(&payload)
-        );
+        return Err(DeviceResponseState {
+            command: request_cmd,
+            state: response.state,
+            payload,
+        }
+        .into());
     }
 
     Ok(payload)
@@ -220,6 +243,11 @@ pub fn send_recv_cmd(
             .and_then(|()| send_recv_cmd_once(port, cmd, data, dlboot));
         match result {
             Ok(payload) => return Ok(payload),
+            Err(error) if error.downcast_ref::<DeviceResponseState>().is_some() => {
+                return Err(error).with_context(|| {
+                    format!("{} was rejected by the device", command_label(cmd.cmd))
+                });
+            }
             Err(error) => {
                 log::warn!(
                     "{} attempt {}/{} failed: {:#}",
@@ -273,6 +301,11 @@ pub fn send_recv_lpc_cmd(port: &mut dyn SerialPort, cmd: &LpcCmd, data: &[u8]) -
             .and_then(|()| send_recv_lpc_cmd_once(port, cmd, data));
         match result {
             Ok(payload) => return Ok(payload),
+            Err(error) if error.downcast_ref::<DeviceResponseState>().is_some() => {
+                return Err(error).with_context(|| {
+                    format!("LPC {} was rejected by the device", command_label(cmd.cmd))
+                });
+            }
             Err(error) => {
                 log::warn!(
                     "LPC {} attempt {}/{} failed: {:#}",
@@ -863,6 +896,26 @@ mod tests {
 
         assert!(error.to_string().contains("command 0x20"));
         assert!(error.to_string().contains("NAK/error 1"));
+    }
+
+    #[test]
+    fn device_nak_is_not_retried() {
+        let nak = response(
+            CMD_GET_VERSION,
+            0,
+            DL_COMMAND_ID,
+            DL_COMMAND_ID_INV,
+            7,
+            &[0x42],
+            false,
+        );
+        let mut port = ScriptedPort::new([Some(nak)], 64);
+        let command = Cmd::new(CMD_GET_VERSION);
+
+        let error = send_recv_cmd(&mut port, &command, &[], true).unwrap_err();
+
+        assert_eq!(port.writes().len(), 1);
+        assert!(format!("{error:#}").contains("NAK/error 7"));
     }
 
     #[test]

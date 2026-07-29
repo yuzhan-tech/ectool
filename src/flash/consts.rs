@@ -71,7 +71,7 @@ impl SyncType {
 }
 
 // Burn image types
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnImageType {
     Bootloader,
     Ap,

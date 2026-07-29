@@ -294,7 +294,6 @@ dependencies = [
  "hex",
  "indicatif",
  "log",
- "regex",
  "serialport",
  "sha2",
  "tempfile",

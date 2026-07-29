@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use serialport::SerialPort;
 
 use super::commands::*;
@@ -15,11 +14,57 @@ pub struct ImageTransferOptions {
     pub dribble_download: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Flash storage selected for an image transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashStorage {
+    /// Main application flash.
+    ApFlash,
+    /// Dedicated communications-processor flash used by non-EC7xx packages.
+    CpFlash,
+}
+
+impl FlashStorage {
+    fn protocol_value(self) -> u8 {
+        match self {
+            Self::ApFlash => STYPE_AP_FLASH,
+            Self::CpFlash => STYPE_CP_FLASH,
+        }
+    }
+}
+
+/// Generic image class accepted by the high-level transfer API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    /// Bootloader image (`BL`).
+    Bootloader,
+    /// Application-processor image (`AP`).
+    Ap,
+    /// Communications-processor image (`CP`).
+    Cp,
+    /// Caller-planned generic FlexFile image.
+    FlexFile,
+}
+
+impl ImageKind {
+    fn protocol_type(self) -> BurnImageType {
+        match self {
+            Self::Bootloader => BurnImageType::Bootloader,
+            Self::Ap => BurnImageType::Ap,
+            Self::Cp => BurnImageType::Cp,
+            Self::FlexFile => BurnImageType::FlexFile,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTarget<'a> {
-    pub image_type: BurnImageType,
-    pub storage_type: u8,
+    /// Generic image class sent in the image header and LPC burn request.
+    pub image_type: ImageKind,
+    /// Physical flash selected for the LPC burn request.
+    pub storage: FlashStorage,
+    /// Raw, non-XIP target address.
     pub address: u32,
+    /// Human-readable context used in progress events and errors.
     pub tag: &'a str,
 }
 
@@ -85,7 +130,7 @@ pub fn burn_img(
 ) -> Result<i32> {
     let ImageTarget {
         image_type,
-        storage_type,
+        storage,
         address,
         tag,
     } = target;
@@ -102,7 +147,7 @@ pub fn burn_img(
         "burn image {} {:?} stor={} addr={:08X}",
         tag,
         image_type,
-        storage_type,
+        storage.protocol_value(),
         address
     );
 
@@ -110,7 +155,8 @@ pub fn burn_img(
     burn_sync(port, SyncType::Lpc, 2)?;
 
     // 2. LPC burn one
-    let ret = lpc_burn_one(port, image_type, storage_type)?;
+    let protocol_type = image_type.protocol_type();
+    let ret = lpc_burn_one(port, protocol_type, storage.protocol_value())?;
     if ret != 0 {
         bail!("lpc_burn_one failed for {}", tag);
     }
@@ -130,7 +176,7 @@ pub fn burn_img(
         address,
         options.is_usb(),
     );
-    package_image_head(port, data, image_type, address, 0, false, controls)
+    package_image_head(port, data, protocol_type, address, 0, false, controls)
         .with_context(|| format!("package_image_head failed for {tag}"))?;
 
     // 6. Data transfer in 64KB blocks
@@ -139,26 +185,11 @@ pub fn burn_img(
     let mut first_block = true;
 
     let total = data.len() as u64;
-    let pb = if progress.is_none() {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(&format!(
-                    "  {{bar:40.cyan/blue}} {{percent:>3}}% {{pos:>7}}/{{len:7}} {}",
-                    tag
-                ))
-                .unwrap()
-                .progress_chars("##-"),
-        );
-        Some(pb)
-    } else {
-        None
-    };
 
     log::debug!("start send file data ...");
     while remain > 0 {
         burn_sync(port, SyncType::AgBoot, 2)?;
-        package_base_info(port, image_type.identifier(), false)
+        package_base_info(port, protocol_type.identifier(), false)
             .with_context(|| format!("block base_info failed for {tag}"))?;
 
         let current_addr = address
@@ -179,9 +210,6 @@ pub fn burn_img(
             &data[data_offset..data_offset + data_len],
             false,
         ) {
-            if let Some(ref pb) = pb {
-                pb.abandon_with_message(format!("{} FAILED", tag));
-            }
             return Err(error).with_context(|| format!("package_data failed for {tag}"));
         }
 
@@ -191,18 +219,10 @@ pub fn burn_img(
         if let Some(ref mut cb) = progress {
             cb(data_offset as u64, total);
         }
-        if let Some(ref pb) = pb {
-            pb.set_position(data_offset as u64);
-        }
     }
 
     log::debug!("almost done burn_img");
-    let ret = lpc_get_burn_status(port)?;
-    if let Some(pb) = pb {
-        pb.finish_with_message(format!("{} done", tag));
-    }
-
-    Ok(ret)
+    lpc_get_burn_status(port)
 }
 
 fn outer_block_len(remaining: usize, current_addr: u32, is_uart: bool, first_block: bool) -> usize {
@@ -233,15 +253,34 @@ pub fn erase_flash_range(
     size: u32,
     tag: &str,
 ) -> Result<i32> {
+    erase_flash_range_with_progress(port, addr, size, tag, None)
+}
+
+/// Erase an AP flash range and report completed bytes through a caller-owned
+/// callback.
+///
+/// The callback is optional and no terminal output is produced by this
+/// operation.
+pub fn erase_flash_range_with_progress(
+    port: &mut dyn SerialPort,
+    addr: u32,
+    size: u32,
+    tag: &str,
+    mut progress: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<i32> {
     if size == 0 {
         bail!("erase size must be greater than zero for {}", tag);
     }
 
     let mut lpc_addr = if addr < 0x800000 {
-        addr + 0x800000
+        addr.checked_add(0x800000)
+            .context("erase address overflow while applying AP-flash XIP bias")?
     } else {
         addr
     };
+    lpc_addr
+        .checked_add(size - 1)
+        .context("erase range overflows 32-bit address space")?;
     let mut remain = size;
 
     log::info!(
@@ -254,30 +293,23 @@ pub fn erase_flash_range(
 
     burn_sync(port, SyncType::Lpc, 2)?;
 
-    let pb = ProgressBar::new(size as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(&format!(
-                "  {{bar:40.cyan/blue}} {{percent:>3}}% {{pos:>7}}/{{len:7}} erase {}",
-                tag
-            ))
-            .unwrap()
-            .progress_chars("##-"),
-    );
-
     while remain > 0 {
         let chunk = remain.min(0x400);
         let ret = lpc_flash_erase(port, lpc_addr, chunk)?;
         if ret != 0 {
-            pb.abandon_with_message(format!("erase {} FAILED", tag));
             return Ok(ret);
         }
-        lpc_addr = lpc_addr.saturating_add(chunk);
         remain -= chunk;
-        pb.set_position((size - remain) as u64);
+        if remain > 0 {
+            lpc_addr = lpc_addr
+                .checked_add(chunk)
+                .context("erase address overflow")?;
+        }
+        if let Some(ref mut cb) = progress {
+            cb((size - remain) as u64, size as u64);
+        }
     }
 
-    pb.finish_with_message(format!("erase {} done", tag));
     Ok(0)
 }
 
@@ -286,14 +318,18 @@ pub fn read_memory_range(port: &mut dyn SerialPort, addr: u32, size: u32) -> Res
     if size == 0 {
         bail!("read size must be greater than zero");
     }
+    addr.checked_add(size - 1)
+        .context("read range overflows 32-bit address space")?;
 
     burn_sync(port, SyncType::Lpc, 2)?;
-    let mut output = Vec::with_capacity(size as usize);
+    let capacity = usize::try_from(size).context("read size does not fit this host")?;
+    let mut output = Vec::with_capacity(capacity);
     let mut offset = 0u32;
 
     while offset < size {
         let chunk = (size - offset).min(MAX_READ_MEM_SIZE as u32);
-        output.extend_from_slice(&lpc_read_mem(port, addr.saturating_add(offset), chunk)?);
+        let chunk_address = addr.checked_add(offset).context("read address overflow")?;
+        output.extend_from_slice(&lpc_read_mem(port, chunk_address, chunk)?);
         offset += chunk;
     }
 

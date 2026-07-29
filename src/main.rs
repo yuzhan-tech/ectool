@@ -3,15 +3,12 @@ mod cli;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, DownloadArgs, Transport};
-use ectool::flash::burn::{
-    burn_agboot, burn_img, erase_flash_range, read_memory_range, sys_reset, ImageTarget,
-    ImageTransferOptions,
+use ectool::{
+    find_download_port_now, open_port, parse_binpkg, plan_binpkg_images, resolve_transfer_config,
+    wait_for_download_port, AgentBootConfig, BinpkgResult, DownloadPort, FlashSession,
+    PackageSelection, PortType, TransferOverrides,
 };
-use ectool::flash::consts::{BurnImageType, SyncType, STYPE_AP_FLASH, STYPE_CP_FLASH};
-use ectool::flash::sync::burn_sync;
-use ectool::package::binpkg::{parse_binpkg, BinpkgEntry, BinpkgResult, BundledFlashConfig};
-use ectool::serial::detect::{find_download_port_now, wait_for_download_port, DownloadPort};
-use ectool::serial::port::{open_port, PortType};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -31,17 +28,6 @@ fn port_type(transport: Transport) -> PortType {
         Transport::Usb => PortType::Usb,
         Transport::Uart => PortType::Uart,
     }
-}
-
-fn transport_name(transport: Transport) -> &'static str {
-    match transport {
-        Transport::Usb => "usb",
-        Transport::Uart => "uart",
-    }
-}
-
-fn resolve_agent_baud(explicit: Option<u32>, bundled: BundledFlashConfig) -> u32 {
-    explicit.or(bundled.agent_baud).unwrap_or(921_600)
 }
 
 fn load_package(path: &Path) -> Result<BinpkgResult> {
@@ -84,11 +70,19 @@ fn prepare_download_port(
     wait_for_download_port(&args.port, Duration::from_secs(args.wait))
 }
 
-fn start_agent(
+fn start_session(
     args: &DownloadArgs,
     at_port: Option<(&str, u32)>,
     package: Option<&BinpkgResult>,
-) -> Result<(Box<dyn serialport::SerialPort>, BundledFlashConfig)> {
+) -> Result<FlashSession> {
+    let resolved = resolve_transfer_config(
+        package,
+        port_type(args.transport),
+        TransferOverrides {
+            agent_baud: args.agent_baud,
+            ..TransferOverrides::default()
+        },
+    )?;
     let agent = fs::read(&args.agentboot)
         .with_context(|| format!("Failed to read agentboot {}", args.agentboot.display()))?;
     if agent.is_empty() {
@@ -98,76 +92,55 @@ fn start_agent(
     let download_port = prepare_download_port(args, at_port)?;
 
     log::info!("Using download port {}", download_port.name);
-    let mut port = open_port(&download_port.name, port_type(args.transport))?;
-    burn_sync(port.as_mut(), SyncType::DlBoot, 2)?;
-
-    let bundled_config = package
-        .map(|package| package.flash_config(transport_name(args.transport)))
-        .transpose()?
-        .unwrap_or_default();
-    let agent_baud = resolve_agent_baud(args.agent_baud, bundled_config);
-    // Existing ectool behavior asserts pullup_qspi in the AgentBoot header.
-    // A transport-specific bundled baseini may explicitly override it.
-    let pullup_qspi = bundled_config.pullup_qspi.unwrap_or(true);
+    let port = open_port(&download_port.name, port_type(args.transport))?;
     log::info!(
         "Loading agentboot {} at {} baud",
         args.agentboot.display(),
-        agent_baud
+        resolved.agent_baud
     );
-    burn_agboot(port.as_mut(), &agent, agent_baud, pullup_qspi)?;
-    if matches!(args.transport, Transport::Uart) {
-        port.set_baud_rate(agent_baud)
-            .with_context(|| format!("Failed to switch UART to agent baud {agent_baud}"))?;
+    FlashSession::start(
+        port,
+        AgentBootConfig {
+            data: &agent,
+            baud: resolved.agent_baud,
+            pullup_qspi: resolved.pullup_qspi,
+        },
+        resolved.transfer,
+    )
+}
+
+fn package_selection(only: &[String]) -> Result<PackageSelection> {
+    if only.is_empty() {
+        return Ok(PackageSelection::all());
     }
-    Ok((port, bundled_config))
-}
 
-fn selected(only: &[String], name: &str) -> bool {
-    only.is_empty() || only.iter().any(|item| item.eq_ignore_ascii_case(name))
-}
-
-fn ap_flash_offset(address: u32) -> u32 {
-    if address >= 0x800000 {
-        address - 0x800000
-    } else {
-        address
-    }
-}
-
-fn validate_only(only: &[String]) -> Result<()> {
+    let mut selection = PackageSelection {
+        bootloader: false,
+        ap: false,
+        cp: false,
+    };
     for item in only {
-        if !["bl", "ap", "cp"]
-            .iter()
-            .any(|allowed| item.eq_ignore_ascii_case(allowed))
-        {
-            bail!("Unknown --only image class {item:?}; expected bl, ap, or cp");
+        match item.trim().to_ascii_lowercase().as_str() {
+            "bl" => selection.bootloader = true,
+            "ap" => selection.ap = true,
+            "cp" => selection.cp = true,
+            _ => bail!("Unknown --only image class {item:?}; expected bl, ap, or cp"),
         }
     }
-    Ok(())
+    Ok(selection)
 }
 
-fn package_entry_target(
-    entry: &BinpkgEntry,
-    only: &[String],
-    is_ec7xx: bool,
-) -> Option<(BurnImageType, u8, u32, &'static str)> {
-    match entry.image_type.to_ascii_uppercase().as_str() {
-        "BL" if selected(only, "bl") => Some((BurnImageType::Bootloader, STYPE_AP_FLASH, 0, "BL")),
-        "AP" if selected(only, "ap") => Some((
-            BurnImageType::Ap,
-            STYPE_AP_FLASH,
-            ap_flash_offset(entry.addr),
-            "AP",
-        )),
-        "CP" if selected(only, "cp") && is_ec7xx => Some((
-            BurnImageType::Cp,
-            STYPE_AP_FLASH,
-            ap_flash_offset(entry.addr),
-            "CP",
-        )),
-        "CP" if selected(only, "cp") => Some((BurnImageType::Cp, STYPE_CP_FLASH, 0, "CP")),
-        _ => None,
-    }
+fn progress_bar(total: u64, label: &str) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(&format!(
+                "  {{bar:40.cyan/blue}} {{percent:>3}}% {{pos:>7}}/{{len:7}} {label}"
+            ))
+            .expect("static progress template is valid")
+            .progress_chars("##-"),
+    );
+    progress
 }
 
 fn flash_package(
@@ -176,108 +149,70 @@ fn flash_package(
     at_port: Option<(&str, u32)>,
     only: &[String],
 ) -> Result<()> {
-    validate_only(only)?;
     let package = load_package(file)?;
+    let selection = package_selection(only)?;
+    let plan = plan_binpkg_images(&package, selection)?;
     log::info!("Package product: {}", package.product_name);
-    let (mut port, bundled_config) = start_agent(args, at_port, Some(&package))?;
-    let transfer_options = ImageTransferOptions {
-        port_type: port_type(args.transport),
-        // Disabled is the safe fallback used when the optional key is absent.
-        dribble_download: bundled_config.dribble_download.unwrap_or(false),
-    };
-    let is_ec7xx = {
-        let product = package.product_name.trim().to_ascii_uppercase();
-        product.contains("EC7") || product.contains("YCOM_7")
-    };
-    let mut flashed = 0usize;
+    let mut session = start_session(args, at_port, Some(&package))?;
 
-    for entry in &package.entries {
-        let Some(data) = entry.data.as_deref() else {
-            continue;
-        };
-        let result = package_entry_target(entry, only, is_ec7xx);
-
-        if let Some((kind, storage, address, tag)) = result {
-            let ret = burn_img(
-                port.as_mut(),
-                data,
-                ImageTarget {
-                    image_type: kind,
-                    storage_type: storage,
-                    address,
-                    tag,
-                },
-                transfer_options,
-                None,
-            )?;
-            if ret != 0 {
-                bail!("Flashing {} failed ({})", entry.name, ret);
-            }
-            flashed += 1;
+    for image in &plan {
+        let data = image
+            .entry
+            .data
+            .as_deref()
+            .expect("the package planner validates retained entry data");
+        let progress = progress_bar(data.len() as u64, image.target.tag);
+        let mut update = |completed, _total| progress.set_position(completed);
+        if let Err(error) = session.flash_image(image.target, data, Some(&mut update)) {
+            progress.abandon_with_message(format!("{} FAILED", image.target.tag));
+            return Err(error).with_context(|| format!("Failed to flash {}", image.entry.name));
         }
+        progress.finish_with_message(format!("{} done", image.target.tag));
     }
 
-    if flashed == 0 {
-        bail!(
-            "No selected BL/AP/CP images were present in {}",
-            file.display()
-        );
-    }
-
-    let ret = sys_reset(port.as_mut())?;
-    if ret != 0 {
-        bail!("Images were written, but the final device reset failed ({ret})");
-    }
-    log::info!("Flash complete: {} image(s)", flashed);
+    session
+        .finish_reset()
+        .context("Images were written, but the final device reset failed")?;
+    log::info!("Flash complete: {} image(s)", plan.len());
     Ok(())
-}
-
-fn complete_diagnostic<T>(
-    port: &mut dyn serialport::SerialPort,
-    operation: Result<T>,
-    label: &str,
-) -> Result<T> {
-    let reset = sys_reset(port);
-    match (operation, reset) {
-        (Ok(value), Ok(0)) => Ok(value),
-        (Ok(_), Ok(ret)) => bail!("{label} completed, but the final device reset failed ({ret})"),
-        (Ok(_), Err(reset_error)) => Err(reset_error)
-            .with_context(|| format!("{label} completed, but the final device reset failed")),
-        (Err(operation_error), Ok(0)) => Err(operation_error)
-            .with_context(|| format!("{label} failed; device reset after the failure")),
-        (Err(operation_error), Ok(ret)) => Err(operation_error).with_context(|| {
-            format!("{label} failed; the recovery device reset also failed ({ret})")
-        }),
-        (Err(operation_error), Err(reset_error)) => Err(operation_error).with_context(|| {
-            format!("{label} failed; the recovery device reset also failed: {reset_error:#}")
-        }),
-    }
 }
 
 fn erase(address: &str, size: &str, args: &DownloadArgs) -> Result<()> {
     let address = parse_u32(address, "address")?;
     let size = parse_u32(size, "size")?;
-    let (mut port, _) = start_agent(args, None, None)?;
-    let operation = erase_flash_range(port.as_mut(), address, size, "range").and_then(|ret| {
-        if ret != 0 {
-            bail!("Erase failed ({ret})");
-        }
-        Ok(())
-    });
-    complete_diagnostic(port.as_mut(), operation, "Erase")
+    let mut session = start_session(args, None, None)?;
+    let progress = progress_bar(size as u64, "erase range");
+    let mut update = |completed, _total| progress.set_position(completed);
+    if let Err(error) = session.erase_with_progress(address, size, Some(&mut update)) {
+        progress.abandon_with_message("erase range FAILED");
+        return Err(error);
+    }
+    progress.finish_with_message("erase range done");
+    session
+        .finish_reset()
+        .context("Erase completed, but the final device reset failed")
 }
 
 fn read(address: &str, size: &str, output: &Path, args: &DownloadArgs) -> Result<()> {
     let address = parse_u32(address, "address")?;
     let size = parse_u32(size, "size")?;
-    let (mut port, _) = start_agent(args, None, None)?;
-    let operation = (|| {
-        let data = read_memory_range(port.as_mut(), address, size)?;
-        fs::write(output, data).with_context(|| format!("Failed to write {}", output.display()))?;
-        log::info!("Wrote {} bytes to {}", size, output.display());
-        Ok(())
-    })();
-    complete_diagnostic(port.as_mut(), operation, "Read")
+    let mut session = start_session(args, None, None)?;
+    let data = session.read(address, size)?;
+    if let Err(write_error) =
+        fs::write(output, data).with_context(|| format!("Failed to write {}", output.display()))
+    {
+        return match session.finish_reset() {
+            Ok(()) => Err(write_error).context("Read succeeded, but writing the output failed"),
+            Err(reset_error) => Err(write_error).context(format!(
+                "Read succeeded, but writing the output failed; the recovery device reset also failed: {reset_error:#}"
+            )),
+        };
+    }
+    session
+        .finish_reset()
+        .context("Read completed, but the final device reset failed")?;
+    log::info!("Wrote {} bytes to {}", size, output.display());
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -347,73 +282,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ap_flash_addresses_accept_xip_and_raw_forms() {
-        assert_eq!(ap_flash_offset(0x882000), 0x082000);
-        assert_eq!(ap_flash_offset(0x082000), 0x082000);
-    }
-
-    #[test]
-    fn agent_baud_precedence_is_explicit_then_bundled_then_default() {
+    fn cli_image_selection_is_typed_and_validated() {
+        assert_eq!(package_selection(&[]).unwrap(), PackageSelection::all());
         assert_eq!(
-            resolve_agent_baud(
-                Some(115_200),
-                BundledFlashConfig {
-                    agent_baud: Some(460_800),
-                    ..BundledFlashConfig::default()
-                }
-            ),
-            115_200
+            package_selection(&["ap".to_string(), "CP".to_string()]).unwrap(),
+            PackageSelection {
+                bootloader: false,
+                ap: true,
+                cp: true,
+            }
         );
-        assert_eq!(
-            resolve_agent_baud(
-                None,
-                BundledFlashConfig {
-                    agent_baud: Some(460_800),
-                    ..BundledFlashConfig::default()
-                }
-            ),
-            460_800
-        );
-        assert_eq!(
-            resolve_agent_baud(None, BundledFlashConfig::default()),
-            921_600
-        );
-    }
-
-    #[test]
-    fn package_metadata_drives_image_address_and_storage() {
-        let ap = fixture_entry("AP", 0x0088_2000, 123);
-        assert_eq!(
-            package_entry_target(&ap, &[], true),
-            Some((BurnImageType::Ap, STYPE_AP_FLASH, 0x0008_2000, "AP"))
-        );
-
-        let cp = fixture_entry("CP", 0x0089_0000, 456);
-        assert_eq!(
-            package_entry_target(&cp, &[], true),
-            Some((BurnImageType::Cp, STYPE_AP_FLASH, 0x0009_0000, "CP"))
-        );
-        assert_eq!(
-            package_entry_target(&cp, &[], false),
-            Some((BurnImageType::Cp, STYPE_CP_FLASH, 0, "CP"))
-        );
-        assert_eq!(cp.image_size, 456);
-    }
-
-    fn fixture_entry(image_type: &str, address: u32, size: u32) -> BinpkgEntry {
-        BinpkgEntry {
-            name: format!("{image_type}.bin"),
-            addr: address,
-            flash_size: size,
-            offset: 0,
-            image_size: size,
-            hash: String::new(),
-            image_type: image_type.to_string(),
-            vt: 0,
-            vtsize: 0,
-            rsvd: 0,
-            pdata: 0,
-            data: Some(vec![0; size as usize]),
-        }
+        assert!(package_selection(&["script".to_string()]).is_err());
     }
 }
